@@ -13,13 +13,16 @@ import struct
 
 PORT = 5555
 
-# Slot 0 is the host; slots 1 and 2 go to the first two clients that join.
-MAX_PLAYERS = 3
-PLAYER_NAMES = ["BLUE", "RED", "GREEN"]
-PLAYER_COLORS = [BLUE, RED, GREEN]
-SPAWNS = [(40.0, 40.0), (1210.0, 40.0), (625.0, 650.0)]
-# Direction each player shoots before they've moved.
-START_FACING = [(1, 0), (-1, 0), (0, -1)]
+# Slot 0 is the host; the other slots go to clients in the order they join.
+# The host can cap how many players get in with --max-players.
+MAX_PLAYERS_LIMIT = 32
+PLAYER_NAMES = ["BLUE", "RED", "GREEN", "ORANGE", "VIOLET", "BROWN", "MAGENTA", "DARKGREEN", "GOLD", "MAROON"]
+PLAYER_COLORS = [BLUE, RED, GREEN, ORANGE, VIOLET, BROWN, MAGENTA, DARKGREEN, GOLD, MAROON]
+# Hand-picked spawns for the first few slots; later slots get a random spot that isn't in a wall.
+SPAWNS = [
+    (40.0, 40.0), (1210.0, 40.0), (625.0, 650.0), (40.0, 650.0), (1210.0, 650.0),
+    (40.0, 345.0), (1210.0, 345.0), (625.0, 40.0), (625.0, 160.0), (240.0, 650.0),
+]
 
 # Power-up kinds. Each one is drawn as a colored circle with a letter on it.
 SPEED_UP, RAPID_FIRE, TRIPLE_SHOT, SHIELD, EXTRA_LIFE = range(5)
@@ -36,14 +39,16 @@ MAX_POWERUPS = 4
 
 # Client -> host: the client's input direction (x, y), each -1, 0 or 1, plus a shoot flag.
 INPUT_FORMAT = "!bbb"
-# Host -> each client: that client's slot, then (x, y, lives, active, effects) for every slot,
-# then how many bullets and power-ups follow. effects is a bitmask of the power-up kinds
-# the player currently has. Then each bullet as BULLET_FORMAT (x, y, owner), then each
-# power-up as POWERUP_FORMAT (x, y, kind).
-STATE_HEADER_FORMAT = "!B" + "ffBBB" * MAX_PLAYERS + "BB"
+# Host -> each client: that client's slot and how many slots there are, then
+# (x, y, lives, active, effects) for every slot, then how many bullets and power-ups follow.
+# effects is a bitmask of the power-up kinds the player currently has. Then each bullet as
+# BULLET_FORMAT (x, y, owner), then each power-up as POWERUP_FORMAT (x, y, kind).
+STATE_PREFIX_FORMAT = "!BB"
 BULLET_FORMAT = "!ffB"
 POWERUP_FORMAT = "!ffB"
-MAX_SENT_BULLETS = 150
+# Keep state packets under a typical LAN MTU (1500 minus IP/UDP headers) so they never
+# get split into fragments. If there are more bullets than fit, the extra ones aren't sent.
+MAX_PACKET_SIZE = 1400
 
 # Seconds without hearing from the other side before we treat them as disconnected.
 TIMEOUT = 3.0
@@ -72,6 +77,44 @@ FACE_CROP = Rectangle(72.0, 744.0, 1008.0, 1008.0)
 FACE_TEXTURE_SIZE = 128
 
 
+def state_header_format(player_count):
+    return STATE_PREFIX_FORMAT + "ffBBB" * player_count + "BB"
+
+
+def player_name(slot):
+    return PLAYER_NAMES[slot] if slot < len(PLAYER_NAMES) else f"P{slot + 1}"
+
+
+def player_color(slot):
+    if slot < len(PLAYER_COLORS):
+        return PLAYER_COLORS[slot]
+    # Spread extra players around the color wheel.
+    return color_from_hsv((slot * 47) % 360, 0.8, 0.8)
+
+
+def spawn_point(slot):
+    if slot < len(SPAWNS):
+        return SPAWNS[slot]
+    # Seeded by slot so the same slot always spawns in the same place.
+    rng = random.Random(slot)
+    walls = make_walls()
+    while True:
+        x = rng.uniform(0.0, SCREEN_WIDTH - PLAYER_SIZE)
+        y = rng.uniform(0.0, SCREEN_HEIGHT - PLAYER_SIZE)
+        rect = Rectangle(x, y, PLAYER_SIZE, PLAYER_SIZE)
+        if not any(check_collision_recs(rect, wall) for wall in walls):
+            return x, y
+
+
+def start_facing(x, y):
+    # Direction a player shoots before they've moved: toward the middle of the map.
+    dx = SCREEN_WIDTH / 2 - (x + PLAYER_SIZE / 2)
+    dy = SCREEN_HEIGHT / 2 - (y + PLAYER_SIZE / 2)
+    if abs(dx) >= abs(dy):
+        return (1 if dx > 0 else -1, 0)
+    return (0, 1 if dy > 0 else -1)
+
+
 class Player:
     def __init__(self, slot):
         self.slot = slot
@@ -82,10 +125,10 @@ class Player:
         self.reset()
 
     def reset(self):
-        self.rect.x, self.rect.y = SPAWNS[self.slot]
+        self.rect.x, self.rect.y = spawn_point(self.slot)
         self.lives = MAX_LIVES
         # Direction this player last moved in; that's where their bullets go.
-        self.facing = START_FACING[self.slot]
+        self.facing = start_facing(self.rect.x, self.rect.y)
         self.last_shot = -SHOOT_COOLDOWN
         # Power-up kind -> time it runs out, for the timed power-ups.
         self.effect_until = {}
@@ -300,12 +343,14 @@ def round_over(players):
 
 
 def pack_state(your_slot, players, bullets, powerups):
-    sent = bullets[:MAX_SENT_BULLETS]
-    values = [your_slot]
+    header_format = state_header_format(len(players))
+    room = MAX_PACKET_SIZE - struct.calcsize(header_format) - len(powerups) * struct.calcsize(POWERUP_FORMAT)
+    sent = bullets[: max(0, min(255, room // struct.calcsize(BULLET_FORMAT)))]
+    values = [your_slot, len(players)]
     for player in players:
         values += [player.rect.x, player.rect.y, player.lives, 1 if player.active else 0, player.effect_mask()]
     values += [len(sent), len(powerups)]
-    data = struct.pack(STATE_HEADER_FORMAT, *values)
+    data = struct.pack(header_format, *values)
     for bullet in sent:
         data += struct.pack(BULLET_FORMAT, bullet[0], bullet[1], bullet[4])
     for powerup in powerups:
@@ -314,19 +359,26 @@ def pack_state(your_slot, players, bullets, powerups):
 
 
 def unpack_state(data, players):
-    # Copies the host's player info into `players` and returns (your_slot, bullets, powerups),
-    # or None if the packet is not a valid state packet.
-    header_size = struct.calcsize(STATE_HEADER_FORMAT)
+    # Copies the host's player info into `players` (growing or shrinking it to match the host)
+    # and returns (your_slot, bullets, powerups), or None if the packet is not a valid state packet.
+    if len(data) < struct.calcsize(STATE_PREFIX_FORMAT):
+        return None
+    player_count = struct.unpack_from(STATE_PREFIX_FORMAT, data)[1]
+    header_format = state_header_format(player_count)
+    header_size = struct.calcsize(header_format)
     bullet_size = struct.calcsize(BULLET_FORMAT)
     powerup_size = struct.calcsize(POWERUP_FORMAT)
     if len(data) < header_size:
         return None
-    values = struct.unpack_from(STATE_HEADER_FORMAT, data)
+    values = struct.unpack_from(header_format, data)
     bullet_count, powerup_count = values[-2], values[-1]
     if len(data) != header_size + bullet_count * bullet_size + powerup_count * powerup_size:
         return None
+    while len(players) < player_count:
+        players.append(Player(len(players)))
+    del players[player_count:]
     for i, player in enumerate(players):
-        x, y, lives, active, mask = values[1 + i * 5 : 6 + i * 5]
+        x, y, lives, active, mask = values[2 + i * 5 : 7 + i * 5]
         player.rect.x, player.rect.y, player.lives, player.active = x, y, lives, bool(active)
         player.effects = {kind for kind in range(len(POWERUP_NAMES)) if mask >> kind & 1}
     offset = header_size
@@ -347,7 +399,7 @@ def draw_player(player, face):
     draw_texture_pro(face, source, rect, Vector2(0.0, 0.0), 0.0, WHITE)
     # Colored ring so you can tell who is who.
     radius = rect.width / 2
-    draw_ring(player.center(), radius - 2, radius + 1, 0.0, 360.0, 36, PLAYER_COLORS[player.slot])
+    draw_ring(player.center(), radius - 2, radius + 1, 0.0, 360.0, 36, player_color(player.slot))
     if SHIELD in player.effects:
         draw_ring(player.center(), radius + 3, radius + 6, 0.0, 360.0, 36, SKYBLUE)
 
@@ -372,19 +424,19 @@ def draw_world(walls, players, bullets, powerups, status, face, show_hud):
         if player.alive():
             draw_player(player, face)
     for bullet in bullets:
-        draw_circle_v(Vector2(bullet[0], bullet[1]), BULLET_RADIUS, PLAYER_COLORS[bullet[2]])
+        draw_circle_v(Vector2(bullet[0], bullet[1]), BULLET_RADIUS, player_color(bullet[2]))
     draw_text(status, 10, 10, 20, BLACK)
 
     if show_hud:
-        # Lives and active power-ups go in the bottom-left corner, away from the spawns.
-        y = SCREEN_HEIGHT - 25 * MAX_PLAYERS - 5
-        for player in players:
-            if player.active:
-                text = f"{PLAYER_NAMES[player.slot]} lives: {player.lives}"
-                if player.effects:
-                    text += "  " + " ".join(POWERUP_NAMES[kind] for kind in sorted(player.effects))
-                draw_text(text, 10, y, 20, PLAYER_COLORS[player.slot])
-                y += 25
+        # Lives and active power-ups go in the bottom-left corner.
+        active = [p for p in players if p.active]
+        y = SCREEN_HEIGHT - 25 * len(active) - 5
+        for player in active:
+            text = f"{player_name(player.slot)} lives: {player.lives}"
+            if player.effects:
+                text += "  " + " ".join(POWERUP_NAMES[kind] for kind in sorted(player.effects))
+            draw_text(text, 10, y, 20, player_color(player.slot))
+            y += 25
 
         legend = "S speed   R rapid fire   3 triple shot   O shield   + extra life"
         width = measure_text(legend, 20)
@@ -392,7 +444,7 @@ def draw_world(walls, players, bullets, powerups, status, face, show_hud):
 
         if round_over(players):
             alive = [p for p in players if p.alive()]
-            winner = PLAYER_NAMES[alive[0].slot] if alive else "NOBODY"
+            winner = player_name(alive[0].slot) if alive else "NOBODY"
             message = f"{winner} WINS! Host presses ENTER to restart"
             width = measure_text(message, 40)
             draw_text(message, (SCREEN_WIDTH - width) // 2, SCREEN_HEIGHT // 2 - 20, 40, BLACK)
@@ -412,7 +464,7 @@ def get_local_ip():
         s.close()
 
 
-def run_host():
+def run_host(max_players):
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.bind(("0.0.0.0", PORT))
     sock.setblocking(False)
@@ -422,7 +474,8 @@ def run_host():
     face = load_face_texture()
 
     walls = make_walls()
-    players = [Player(slot) for slot in range(MAX_PLAYERS)]
+    # Starts with just the host; a slot is added each time someone joins and no old slot is free.
+    players = [Player(0)]
     players[0].active = True
     bullets = []
     powerups = []
@@ -430,7 +483,8 @@ def run_host():
 
     # Client address -> the slot they're playing in.
     clients = {}
-    last_heard = [0.0] * MAX_PLAYERS
+    last_heard = [0.0]
+    packet_size = 0
     local_ip = get_local_ip()
 
     while not window_should_close():
@@ -447,11 +501,17 @@ def run_host():
                 continue
             slot = clients.get(addr)
             if slot is None:
+                # Reuse the slot of someone who left, otherwise add a new one.
                 free = [p.slot for p in players if not p.active]
-                if not free:
+                if free:
+                    slot = free[0]
+                elif len(players) < max_players:
+                    slot = len(players)
+                    players.append(Player(slot))
+                    last_heard.append(0.0)
+                else:
                     # Game is full.
                     continue
-                slot = free[0]
                 clients[addr] = slot
                 players[slot].reset()
                 players[slot].active = True
@@ -494,15 +554,17 @@ def run_host():
             next_powerup_time = now + POWERUP_INTERVAL
 
         for addr, slot in clients.items():
+            packet = pack_state(slot, players, bullets, powerups)
+            packet_size = len(packet)
             try:
-                sock.sendto(pack_state(slot, players, bullets, powerups), addr)
+                sock.sendto(packet, addr)
             except OSError:
                 pass
 
         count = sum(1 for p in players if p.active)
         status = (
-            f"You are BLUE - hosting on {local_ip}:{PORT} - {count}/{MAX_PLAYERS} players"
-            " (SPACE to shoot, ENTER to restart)"
+            f"You are {player_name(0)} - hosting on {local_ip}:{PORT} - {count} players"
+            f" - {get_fps()} FPS, {packet_size} B/packet (SPACE shoot, ENTER restart)"
         )
         # Bullets are drawn as (x, y, owner) on both host and client.
         drawn_bullets = [(b[0], b[1], b[4]) for b in bullets]
@@ -523,13 +585,18 @@ def run_client(host_ip):
     face = load_face_texture()
 
     walls = make_walls()
-    players = [Player(slot) for slot in range(MAX_PLAYERS)]
+    # Filled in from the host's state packets, which say how many slots there are.
+    players = []
     bullets = []
     powerups = []
     my_slot = None
 
     have_state = False
     last_heard = 0.0
+    # State packets received per second, to see how smooth the connection is.
+    packets_this_second = 0
+    updates_per_second = 0
+    second_start = get_time()
 
     while not window_should_close():
         # The client only sends its keys; the host does all the movement, shooting and collision.
@@ -551,11 +618,20 @@ def run_client(host_ip):
                 my_slot, bullets, powerups = state
                 have_state = True
                 last_heard = get_time()
+                packets_this_second += 1
+
+        if get_time() - second_start >= 1.0:
+            updates_per_second = packets_this_second
+            packets_this_second = 0
+            second_start = get_time()
 
         connected = have_state and get_time() - last_heard < TIMEOUT
 
         if connected:
-            status = f"You are {PLAYER_NAMES[my_slot]} - connected (SPACE to shoot)"
+            status = (
+                f"You are {player_name(my_slot)} - connected - {get_fps()} FPS,"
+                f" {updates_per_second} updates/s (SPACE to shoot)"
+            )
             draw_world(walls, players, bullets, powerups, status, face, True)
         else:
             status = f"Connecting to {host_ip}:{PORT}..."
@@ -567,14 +643,21 @@ def run_client(host_ip):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="LAN shooter for up to 3 players")
+    parser = argparse.ArgumentParser(description="LAN shooter for any number of players")
     parser.add_argument("--join", metavar="HOST_IP", help="join a host at this IP instead of hosting")
+    parser.add_argument(
+        "--max-players", type=int, default=MAX_PLAYERS_LIMIT,
+        help=f"when hosting, optional cap on players, host included (default and highest: {MAX_PLAYERS_LIMIT})",
+    )
     args = parser.parse_args()
+
+    if not 1 <= args.max_players <= MAX_PLAYERS_LIMIT:
+        parser.error(f"--max-players must be between 1 and {MAX_PLAYERS_LIMIT}")
 
     if args.join:
         run_client(args.join)
     else:
-        run_host()
+        run_host(args.max_players)
 
 
 if __name__ == "__main__":
