@@ -1,4 +1,5 @@
 import argparse
+import ipaddress
 import math
 import os
 import random
@@ -11,9 +12,20 @@ from raylib import *
 # and the star import would otherwise replace Python's struct module.
 import select
 import struct
+import sys
 import time
 
+import psutil
+
 PORT = 5555
+
+# Clients find the host by broadcasting DISCOVERY_REQUEST on the local network; the host answers
+# with DISCOVERY_REPLY, which tells the client the host's IP, so nobody has to type one in.
+# Both are longer than an input packet so the host can't mistake one for the other.
+DISCOVERY_REQUEST = b"COLLISION_TEST_LOOKING"
+DISCOVERY_REPLY = b"COLLISION_TEST_HOSTING"
+# While not connected, a client asks again this often (seconds).
+DISCOVERY_INTERVAL = 0.5
 
 # Slot 0 is the host; the other slots go to clients in the order they join.
 # The host can cap how many players get in with --max-players.
@@ -42,7 +54,8 @@ MAX_POWERUPS = 4
 # Client -> host: the client's input direction (x, y), each -1, 0 or 1, plus a shoot flag.
 INPUT_FORMAT = "!bbb"
 # Host -> each client: that client's slot and how many slots there are, then
-# (x, y, lives, active, effects) for every slot, then how many bullets and power-ups follow.
+# (x, y, lives, active, effects) for every slot, then whether damage is on, then how many
+# bullets and power-ups follow.
 # effects is a bitmask of the power-up kinds the player currently has. Then each bullet as
 # BULLET_FORMAT (x, y, owner), then each power-up as POWERUP_FORMAT (x, y, kind).
 STATE_PREFIX_FORMAT = "!BB"
@@ -79,15 +92,25 @@ SPREAD_ANGLE = 15.0
 MAX_LIVES = 3
 # Extra life power-ups can take you above MAX_LIVES, up to this.
 MAX_BONUS_LIVES = 5
+# After a hit (losing a life or a shield) a player can't be hit again for this many seconds,
+# so a triple shot or a crowd can't wipe out all their lives at once.
+INVINCIBLE_TIME = 1.0
+# Not a power-up, but sent to clients in the same effects bitmask so they can draw it.
+INVINCIBLE = len(POWERUP_NAMES)
+# How many times a second an invincible player blinks.
+BLINK_RATE = 10
 
-FACE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "pic", "image.png")
+# In the packaged app (PyInstaller), bundled files are unpacked to sys._MEIPASS;
+# otherwise they sit next to this file.
+BASE_DIR = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
+FACE_PATH = os.path.join(BASE_DIR, "pic", "image.png")
 # Square around the face in the original 1080x2400 photo.
 FACE_CROP = Rectangle(72.0, 744.0, 1008.0, 1008.0)
 FACE_TEXTURE_SIZE = 128
 
 
 def state_header_format(player_count):
-    return STATE_PREFIX_FORMAT + "ffBBB" * player_count + "BB"
+    return STATE_PREFIX_FORMAT + "ffBBB" * player_count + "BBB"
 
 
 def player_name(slot):
@@ -142,7 +165,8 @@ class Player:
         # Power-up kind -> time it runs out, for the timed power-ups.
         self.effect_until = {}
         self.shield = False
-        # Power-up kinds active right now. The host works this out each frame;
+        self.invincible_until = 0.0
+        # Power-up kinds active right now, plus INVINCIBLE. The host works this out each frame;
         # clients get it from the host.
         self.effects = set()
 
@@ -150,6 +174,8 @@ class Player:
         self.effects = {kind for kind, until in self.effect_until.items() if now < until}
         if self.shield:
             self.effects.add(SHIELD)
+        if now < self.invincible_until:
+            self.effects.add(INVINCIBLE)
 
     def effect_mask(self):
         return sum(1 << kind for kind in self.effects)
@@ -294,7 +320,7 @@ def try_shoot(bullets, player, now):
             spawn_bullet(bullets, player, angle)
 
 
-def update_bullets(bullets, wall_boxes, players):
+def update_bullets(bullets, wall_boxes, players, damage_on, now):
     dt = get_frame_time()
     # Work out every player's center once per frame instead of once per bullet.
     half = PLAYER_SIZE / 2
@@ -306,17 +332,23 @@ def update_bullets(bullets, wall_boxes, players):
         bullet[1] += bullet[3] * dt
         x, y = bullet[0], bullet[1]
 
-        # A bullet can hit anyone except the player who fired it.
+        # A bullet can hit anyone except the player who fired it. Bullets fly straight
+        # through invincible players.
         hit = False
         for player, px, py in targets:
-            # lives is checked too, in case another bullet killed them earlier this frame.
-            if player.slot == bullet[4] or player.lives <= 0:
+            # lives and invincibility are checked per bullet, in case another bullet
+            # hit them earlier this frame.
+            if player.slot == bullet[4] or player.lives <= 0 or now < player.invincible_until:
                 continue
             if (x - px) ** 2 + (y - py) ** 2 <= hit_distance_sq:
-                if player.shield:
-                    player.shield = False
-                else:
-                    player.lives -= 1
+                # With damage off (warm-up) bullets still stop on players but don't hurt them.
+                if damage_on:
+                    if player.shield:
+                        player.shield = False
+                    else:
+                        player.lives -= 1
+                    player.invincible_until = now + INVINCIBLE_TIME
+                    player.update_effects(now)
                 hit = True
                 break
         if hit:
@@ -376,7 +408,7 @@ def round_over(players):
     return len(active) >= 2 and len(alive) <= 1
 
 
-def pack_state(players, bullets, powerups):
+def pack_state(players, bullets, powerups, damage_on):
     # Builds the state packet with the receiver's slot left as 0. Everything else is the same
     # for every client, so the host builds it once per frame and uses with_slot() per client.
     header_format = state_header_format(len(players))
@@ -385,7 +417,7 @@ def pack_state(players, bullets, powerups):
     values = [0, len(players)]
     for player in players:
         values += [player.rect.x, player.rect.y, player.lives, 1 if player.active else 0, player.effect_mask()]
-    values += [len(sent), len(powerups)]
+    values += [1 if damage_on else 0, len(sent), len(powerups)]
     parts = [struct.pack(header_format, *values)]
     parts += [struct.pack(BULLET_FORMAT, bullet[0], bullet[1], bullet[4]) for bullet in sent]
     parts += [struct.pack(POWERUP_FORMAT, *powerup) for powerup in powerups]
@@ -400,7 +432,7 @@ def with_slot(packet, slot):
 def unpack_header(data):
     # Returns (header values, header size) for a valid state packet, otherwise None.
     # header values are: your_slot, player count, (x, y, lives, active, effects) per player,
-    # bullet count, power-up count.
+    # damage on, bullet count, power-up count.
     if len(data) < struct.calcsize(STATE_PREFIX_FORMAT):
         return None
     player_count = struct.unpack_from(STATE_PREFIX_FORMAT, data)[1]
@@ -418,7 +450,7 @@ def unpack_header(data):
 
 def unpack_state(data, players):
     # Copies the host's player info into `players` (growing or shrinking it to match the host)
-    # and returns (your_slot, bullets, powerups), or None if the packet is not a valid state packet.
+    # and returns (your_slot, bullets, powerups, damage_on), or None if the packet is not a valid state packet.
     header = unpack_header(data)
     if header is None:
         return None
@@ -432,7 +464,7 @@ def unpack_state(data, players):
     for i, player in enumerate(players):
         x, y, lives, active, mask = values[2 + i * 5 : 7 + i * 5]
         player.rect.x, player.rect.y, player.lives, player.active = x, y, lives, bool(active)
-        player.effects = {kind for kind in range(len(POWERUP_NAMES)) if mask >> kind & 1}
+        player.effects = {kind for kind in range(INVINCIBLE + 1) if mask >> kind & 1}
     offset = header_size
     bullets = []
     for _ in range(bullet_count):
@@ -442,16 +474,24 @@ def unpack_state(data, players):
     for _ in range(powerup_count):
         powerups.append(struct.unpack_from(POWERUP_FORMAT, data, offset))
         offset += powerup_size
-    return values[0], bullets, powerups
+    return values[0], bullets, powerups, bool(values[-3])
 
 
 def draw_player(player, face):
     rect = player.rect
     source = Rectangle(0.0, 0.0, face.width, face.height)
-    draw_texture_pro(face, source, rect, Vector2(0.0, 0.0), 0.0, WHITE)
-    # Colored ring so you can tell who is who.
+    tint, ring_color = WHITE, player_color(player.slot)
     radius = rect.width / 2
-    draw_ring(player.center(), radius - 2, radius + 1, 0.0, 360.0, 36, player_color(player.slot))
+    if INVINCIBLE in player.effects:
+        # Just got hit: blink between a red flash and see-through until invincibility wears off.
+        if int(get_time() * BLINK_RATE * 2) % 2 == 0:
+            tint = Color(255, 70, 70, 255)
+            draw_circle_v(player.center(), radius + 8, fade(RED, 0.35))
+        else:
+            tint, ring_color = fade(WHITE, 0.3), fade(ring_color, 0.3)
+    draw_texture_pro(face, source, rect, Vector2(0.0, 0.0), 0.0, tint)
+    # Colored ring so you can tell who is who.
+    draw_ring(player.center(), radius - 2, radius + 1, 0.0, 360.0, 36, ring_color)
     if SHIELD in player.effects:
         draw_ring(player.center(), radius + 3, radius + 6, 0.0, 360.0, 36, SKYBLUE)
 
@@ -465,7 +505,24 @@ def draw_powerup(powerup):
     draw_text(letter, int(x - width / 2), int(y - 8), 16, BLACK)
 
 
-def draw_world(walls, players, bullets, powerups, status, face, show_hud):
+def draw_centered_text(text, y, size, color):
+    draw_text(text, (SCREEN_WIDTH - measure_text(text, size)) // 2, y, size, color)
+
+
+def draw_button(rect, label, color):
+    hovered = check_collision_point_rec(get_mouse_position(), rect)
+    draw_rectangle_rec(rect, color_brightness(color, 0.2) if hovered else color)
+    draw_rectangle_lines_ex(rect, 2.0, BLACK)
+    width = measure_text(label, 20)
+    draw_text(label, int(rect.x + (rect.width - width) / 2), int(rect.y + (rect.height - 20) / 2), 20, WHITE)
+
+
+def button_clicked(rect):
+    return is_mouse_button_pressed(MOUSE_BUTTON_LEFT) and check_collision_point_rec(get_mouse_position(), rect)
+
+
+def draw_world(walls, players, bullets, powerups, status, face, show_hud, damage_on=True, overlay=None):
+    # overlay, if given, is called last so it can draw on top of everything (buttons, menus).
     begin_drawing()
     clear_background(Color(160, 200, 255, 255))
     for wall in walls:
@@ -487,8 +544,9 @@ def draw_world(walls, players, bullets, powerups, status, face, show_hud):
         y = SCREEN_HEIGHT - line_height * len(active) - 5
         for player in active:
             text = f"{player_name(player.slot)} lives: {player.lives}"
-            if player.effects:
-                text += "  " + " ".join(POWERUP_NAMES[kind] for kind in sorted(player.effects))
+            powerups_held = sorted(kind for kind in player.effects if kind < len(POWERUP_NAMES))
+            if powerups_held:
+                text += "  " + " ".join(POWERUP_NAMES[kind] for kind in powerups_held)
             draw_text(text, 10, y, font_size, player_color(player.slot))
             y += line_height
 
@@ -496,12 +554,15 @@ def draw_world(walls, players, bullets, powerups, status, face, show_hud):
         width = measure_text(legend, 20)
         draw_text(legend, SCREEN_WIDTH - width - 10, SCREEN_HEIGHT - 25, 20, BLACK)
 
+        if not damage_on:
+            draw_centered_text("WARM-UP: NO DAMAGE", 60, 30, MAROON)
+
         if round_over(players):
             alive = [p for p in players if p.alive()]
             winner = player_name(alive[0].slot) if alive else "NOBODY"
-            message = f"{winner} WINS! Host presses ENTER to restart"
-            width = measure_text(message, 40)
-            draw_text(message, (SCREEN_WIDTH - width) // 2, SCREEN_HEIGHT // 2 - 20, 40, BLACK)
+            draw_centered_text(f"{winner} WINS! Host presses ENTER to restart", SCREEN_HEIGHT // 2 - 20, 40, BLACK)
+    if overlay is not None:
+        overlay()
     end_drawing()
 
 
@@ -518,15 +579,35 @@ def get_local_ip():
         s.close()
 
 
-def run_host(max_players, debug, auto_restart):
-    # debug shows the load stats on screen; auto_restart is only offered with --debug.
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    sock.bind(("0.0.0.0", PORT))
-    sock.setblocking(False)
+def broadcast_addresses():
+    # Where clients send discovery requests. 255.255.255.255 reaches everyone on the local
+    # network, but Windows sends it out of only one network card (sometimes a virtual one, like
+    # VirtualBox's), so also use the broadcast address of every network this computer is on.
+    # 127.0.0.1 finds a host running on this same computer.
+    addresses = {"255.255.255.255", "127.0.0.1"}
+    for nic in psutil.net_if_addrs().values():
+        for address in nic:
+            if address.family == socket.AF_INET and address.netmask and not address.address.startswith("127."):
+                network = ipaddress.IPv4Network(f"{address.address}/{address.netmask}", strict=False)
+                addresses.add(str(network.broadcast_address))
+    return addresses
 
-    init_window(SCREEN_WIDTH, SCREEN_HEIGHT, "Collision Test - Host")
-    set_target_fps(60)
-    face = load_face_texture()
+
+def open_host_socket():
+    # Raises OSError if the port is taken, e.g. a game is already hosted on this computer.
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        sock.bind(("0.0.0.0", PORT))
+    except OSError:
+        sock.close()
+        raise
+    sock.setblocking(False)
+    return sock
+
+
+def run_host(sock, face, max_players, debug, auto_restart):
+    # debug shows the load stats on screen; auto_restart is only offered with --debug.
+    set_window_title("Collision Test - Host")
 
     walls = make_walls()
     wall_boxes = [to_box(wall) for wall in walls]
@@ -542,6 +623,10 @@ def run_host(max_players, debug, auto_restart):
     last_heard = [0.0]
     local_ip = get_local_ip()
     round_over_since = None
+    # The host can turn damage off (warm-up) while people are still joining.
+    damage_on = True
+    # Kept above the top-right spawn so it doesn't hide that player.
+    damage_button = Rectangle(SCREEN_WIDTH - 220.0, 6.0, 210.0, 30.0)
 
     # Load stats, shown on screen with --debug and refreshed once a second. "work" is the time the host
     # spends on game logic and networking each frame; if it gets near 16.7 ms (one frame at
@@ -562,6 +647,13 @@ def run_host(max_players, debug, auto_restart):
                 break
             except ConnectionResetError:
                 # Windows reports "client closed" this way for UDP; just ignore it.
+                continue
+            if data == DISCOVERY_REQUEST:
+                # Someone is looking for a game; tell them where we are.
+                try:
+                    sock.sendto(DISCOVERY_REPLY, addr)
+                except OSError:
+                    pass
                 continue
             if len(data) != struct.calcsize(INPUT_FORMAT):
                 continue
@@ -594,6 +686,11 @@ def run_host(max_players, debug, auto_restart):
         players[0].input = read_input()
         now = get_time()
 
+        # Turning damage back on starts a fresh round so everyone begins at full lives.
+        damage_toggled = is_key_pressed(KEY_T) or button_clicked(damage_button)
+        if damage_toggled:
+            damage_on = not damage_on
+
         if not round_over(players):
             round_over_since = None
             alive = [p for p in players if p.alive()]
@@ -607,7 +704,7 @@ def run_host(max_players, debug, auto_restart):
                 move_player(player.rect, player.input[0], player.input[1], blockers, speed)
                 boxes[i] = to_box(player.rect)
                 try_shoot(bullets, player, now)
-            update_bullets(bullets, wall_boxes, players)
+            update_bullets(bullets, wall_boxes, players, damage_on, now)
             pick_up_powerups(powerups, players, now)
 
             if now >= next_powerup_time:
@@ -618,7 +715,7 @@ def run_host(max_players, debug, auto_restart):
             round_over_since = now
 
         auto_restart_due = auto_restart and round_over_since is not None and now - round_over_since >= AUTO_RESTART_DELAY
-        if is_key_pressed(KEY_ENTER) or auto_restart_due:
+        if is_key_pressed(KEY_ENTER) or auto_restart_due or (damage_toggled and damage_on):
             for player in players:
                 player.reset()
             bullets.clear()
@@ -626,7 +723,7 @@ def run_host(max_players, debug, auto_restart):
             next_powerup_time = now + POWERUP_INTERVAL
             round_over_since = None
 
-        packet = pack_state(players, bullets, powerups)
+        packet = pack_state(players, bullets, powerups, damage_on)
         packet_size = len(packet)
         for addr, slot in clients.items():
             try:
@@ -649,28 +746,38 @@ def run_host(max_players, debug, auto_restart):
 
         count = sum(1 for p in players if p.active)
         status = (
-            f"You are {player_name(0)} - hosting on {local_ip}:{PORT} - {count} players"
+            f"You are {player_name(0)} - hosting on {local_ip} - {count} players"
             " (SPACE to shoot, ENTER to restart)"
         )
         if debug:
             status += "\n" + stats
         # Bullets are drawn as (x, y, owner) on both host and client.
         drawn_bullets = [(b[0], b[1], b[4]) for b in bullets]
-        draw_world(walls, players, drawn_bullets, powerups, status, face, True)
+        if damage_on:
+            button_label, button_color = "DAMAGE: ON  (T)", DARKGREEN
+        else:
+            button_label, button_color = "DAMAGE: OFF  (T)", MAROON
+        draw_world(
+            walls, players, drawn_bullets, powerups, status, face, True, damage_on,
+            lambda: draw_button(damage_button, button_label, button_color),
+        )
 
-    unload_texture(face)
-    close_window()
     sock.close()
 
 
-def run_client(host_ip, debug):
+def run_client(join_ip, face, debug):
+    # Plays as a client until the window is closed. With join_ip None the host is found
+    # automatically on the local network. While not connected there is also a button to host
+    # instead; if it's used, this returns the host's socket, otherwise None.
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
     sock.bind(("0.0.0.0", 0))
     sock.setblocking(False)
 
-    init_window(SCREEN_WIDTH, SCREEN_HEIGHT, "Collision Test - Client")
-    set_target_fps(60)
-    face = load_face_texture()
+    host_ip = join_ip
+    next_discovery = 0.0
+    host_button = Rectangle((SCREEN_WIDTH - 300) / 2, SCREEN_HEIGHT / 2 + 40, 300.0, 50.0)
+    host_error = ""
 
     walls = make_walls()
     # Filled in from the host's state packets, which say how many slots there are.
@@ -679,7 +786,10 @@ def run_client(host_ip, debug):
     powerups = []
     my_slot = None
 
+    damage_on = True
+
     have_state = False
+    connected = False
     last_heard = 0.0
     # State packets received per second, shown with --debug to see how smooth the connection is.
     packets_this_second = 0
@@ -688,22 +798,27 @@ def run_client(host_ip, debug):
 
     while not window_should_close():
         # The client only sends its keys; the host does all the movement, shooting and collision.
-        try:
-            sock.sendto(struct.pack(INPUT_FORMAT, *read_input()), (host_ip, PORT))
-        except OSError:
-            pass
+        if host_ip is not None:
+            try:
+                sock.sendto(struct.pack(INPUT_FORMAT, *read_input()), (host_ip, PORT))
+            except OSError:
+                pass
 
         while True:
             try:
-                data, _ = sock.recvfrom(4096)
+                data, addr = sock.recvfrom(4096)
             except BlockingIOError:
                 break
             except ConnectionResetError:
                 # Windows reports "host not running" this way for UDP; keep trying.
                 continue
+            if data == DISCOVERY_REPLY:
+                if not connected:
+                    host_ip = addr[0]
+                continue
             state = unpack_state(data, players)
             if state is not None:
-                my_slot, bullets, powerups = state
+                my_slot, bullets, powerups, damage_on = state
                 have_state = True
                 last_heard = get_time()
                 packets_this_second += 1
@@ -714,19 +829,55 @@ def run_client(host_ip, debug):
             second_start = get_time()
 
         connected = have_state and get_time() - last_heard < TIMEOUT
+        if have_state and not connected:
+            # Lost the host; go back to looking for one.
+            have_state = False
+            host_ip = join_ip
+
+        # Keep asking who's hosting until we're in a game (and again if the host goes away).
+        if not connected and join_ip is None and get_time() >= next_discovery:
+            next_discovery = get_time() + DISCOVERY_INTERVAL
+            for address in broadcast_addresses():
+                try:
+                    sock.sendto(DISCOVERY_REQUEST, (address, PORT))
+                except OSError:
+                    pass
 
         if connected:
             status = f"You are {player_name(my_slot)} - connected (SPACE to shoot)"
             if debug:
                 status += f"\n{get_fps()} FPS | {updates_per_second} updates/s from host"
-            draw_world(walls, players, bullets, powerups, status, face, True)
-        else:
-            status = f"Connecting to {host_ip}:{PORT}..."
-            draw_world(walls, [], [], [], status, face, False)
+            draw_world(walls, players, bullets, powerups, status, face, True, damage_on)
+            continue
 
-    unload_texture(face)
-    close_window()
+        if is_key_pressed(KEY_H) or button_clicked(host_button):
+            try:
+                host_sock = open_host_socket()
+            except OSError:
+                host_error = f"Can't host: port {PORT} is in use. Is the game already hosting on this computer?"
+            else:
+                sock.close()
+                return host_sock
+
+        def draw_search_screen():
+            if host_ip is None:
+                title = "Looking for a game on your network..."
+            else:
+                title = f"Joining the game at {host_ip}..."
+            panel = Rectangle((SCREEN_WIDTH - 800) / 2, SCREEN_HEIGHT / 2 - 110, 800.0, 260.0)
+            draw_rectangle_rec(panel, fade(WHITE, 0.9))
+            draw_rectangle_lines_ex(panel, 2.0, DARKGRAY)
+            draw_centered_text(title, SCREEN_HEIGHT // 2 - 80, 30, BLACK)
+            draw_centered_text("You'll join by yourself as soon as the host has started.", SCREEN_HEIGHT // 2 - 35, 20, DARKGRAY)
+            draw_centered_text("Hosting? Click the button:", SCREEN_HEIGHT // 2 + 10, 20, DARKGRAY)
+            draw_button(host_button, "HOST A GAME  (H)", DARKBLUE)
+            if host_error:
+                draw_centered_text(host_error, SCREEN_HEIGHT // 2 + 110, 20, MAROON)
+
+        draw_world(walls, [], [], [], "", face, False, overlay=draw_search_screen)
+
     sock.close()
+    return None
 
 
 class Bot:
@@ -879,8 +1030,11 @@ def run_bots(host_ip, count):
 
 
 def main():
+    # With no options the game looks for a host on the local network and joins it by itself,
+    # and shows a button to host instead.
     parser = argparse.ArgumentParser(description="LAN shooter for any number of players")
-    parser.add_argument("--join", metavar="HOST_IP", help="join a host at this IP instead of hosting")
+    parser.add_argument("--host", action="store_true", help="start hosting right away")
+    parser.add_argument("--join", metavar="HOST_IP", help="join the host at this IP instead of searching for one")
     parser.add_argument(
         "--max-players", type=int, default=MAX_PLAYERS_LIMIT,
         help=f"when hosting, optional cap on players, host included (default and highest: {MAX_PLAYERS_LIMIT})",
@@ -908,13 +1062,23 @@ def main():
         parser.error("--bots and --auto-restart are testing options; add --debug to use them")
     if args.bots is not None and (not args.join or args.bots < 1):
         parser.error("--bots needs --join HOST_IP and a count of at least 1")
+    if args.host and args.join:
+        parser.error("use either --host or --join, not both")
 
     if args.join and args.bots:
         run_bots(args.join, args.bots)
-    elif args.join:
-        run_client(args.join, args.debug)
-    else:
-        run_host(args.max_players, args.debug, args.auto_restart)
+        return
+
+    host_sock = open_host_socket() if args.host else None
+    init_window(SCREEN_WIDTH, SCREEN_HEIGHT, "Collision Test")
+    set_target_fps(60)
+    face = load_face_texture()
+    if host_sock is None:
+        host_sock = run_client(args.join, face, args.debug)
+    if host_sock is not None:
+        run_host(host_sock, face, args.max_players, args.debug, args.auto_restart)
+    unload_texture(face)
+    close_window()
 
 
 if __name__ == "__main__":

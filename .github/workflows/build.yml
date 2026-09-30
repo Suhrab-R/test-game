@@ -1,0 +1,47 @@
+# Builds the game for Windows and Mac every time main is pushed (or when started by hand from
+# the Actions tab). The finished files are under "Artifacts" at the bottom of each run's page.
+name: Build game
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            artifact: CollisionTest-Windows
+          - os: macos-latest
+            artifact: CollisionTest-Mac-AppleSilicon
+          - os: macos-15-intel
+            artifact: CollisionTest-Mac-Intel
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - run: pip install -r requirements.txt pyinstaller
+      - run: pyinstaller --noconfirm CollisionTest.spec
+
+      - name: Upload Windows exe
+        if: runner.os == 'Windows'
+        uses: actions/upload-artifact@v5
+        with:
+          name: ${{ matrix.artifact }}
+          path: dist/CollisionTest.exe
+
+      # ditto keeps the app's permissions and symlinks, which a plain upload would lose.
+      - name: Zip Mac app
+        if: runner.os == 'macOS'
+        run: ditto -c -k --keepParent dist/CollisionTest.app dist/${{ matrix.artifact }}.zip
+      - name: Upload Mac app
+        if: runner.os == 'macOS'
+        uses: actions/upload-artifact@v5
+        with:
+          name: ${{ matrix.artifact }}
+          path: dist/${{ matrix.artifact }}.zip
