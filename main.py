@@ -10,11 +10,16 @@ from raylib import *
 
 # Imported after pyray on purpose: pyray also exports a name called "struct",
 # and the star import would otherwise replace Python's struct module.
+import json
 import select
+import ssl
 import struct
 import sys
+import threading
 import time
+import urllib.request
 
+import certifi
 import psutil
 
 PORT = 5555
@@ -26,6 +31,17 @@ DISCOVERY_REQUEST = b"COLLISION_TEST_LOOKING"
 DISCOVERY_REPLY = b"COLLISION_TEST_HOSTING"
 # While not connected, a client asks again this often (seconds).
 DISCOVERY_INTERVAL = 0.5
+
+# Some networks (like campus Wi-Fi) block broadcasts, so the host also posts its IP to ntfy.sh,
+# a free public message relay, and clients listen there for it. Clients then ask those IPs
+# directly with DISCOVERY_REQUEST. The topic name is random so nobody else uses it by accident.
+RELAY_URL = "https://ntfy.sh/collisiontest-71221541d479d0f6"
+# The host posts its IP again this often (seconds). ntfy.sh keeps messages for 12 hours.
+RELAY_ANNOUNCE_INTERVAL = 600.0
+# How many of the most recently posted host IPs a client tries.
+RELAY_MAX_HOSTS = 5
+# Use certifi's certificates: a packaged Mac app can't always find the system ones.
+RELAY_SSL = ssl.create_default_context(cafile=certifi.where())
 
 # Slot 0 is the host; the other slots go to clients in the order they join.
 # The host can cap how many players get in with --max-players.
@@ -593,6 +609,55 @@ def broadcast_addresses():
     return addresses
 
 
+def announce_to_relay():
+    # Runs in a background thread while hosting: posts this computer's IP to the relay.
+    while True:
+        local_ip = get_local_ip()
+        if local_ip != "127.0.0.1":
+            try:
+                request = urllib.request.Request(RELAY_URL, data=local_ip.encode(), method="POST")
+                urllib.request.urlopen(request, timeout=10, context=RELAY_SSL).close()
+            except OSError:
+                # No internet right now; try again soon. Broadcasts still work where allowed.
+                time.sleep(30)
+                continue
+        time.sleep(RELAY_ANNOUNCE_INTERVAL)
+
+
+class RelayListener:
+    # Background thread that keeps a list of the host IPs most recently posted to the relay.
+    def __init__(self):
+        self.hosts = []
+        threading.Thread(target=self.run, daemon=True).start()
+
+    def add(self, text):
+        try:
+            ip = ipaddress.IPv4Address(text.strip())
+        except ValueError:
+            return
+        # Only local network addresses; anything else posted to the topic is ignored.
+        if not ip.is_private or ip.is_loopback:
+            return
+        hosts = [host for host in self.hosts if host != str(ip)] + [str(ip)]
+        # Swapped in whole so the game thread never sees a half-updated list.
+        self.hosts = hosts[-RELAY_MAX_HOSTS:]
+
+    def run(self):
+        while True:
+            try:
+                # Sends every message from the last 12 hours, then stays open and sends new
+                # ones as they're posted (with a keepalive every 45 seconds).
+                url = RELAY_URL + "/json?since=12h"
+                with urllib.request.urlopen(url, timeout=120, context=RELAY_SSL) as stream:
+                    for line in stream:
+                        event = json.loads(line)
+                        if event.get("event") == "message":
+                            self.add(event.get("message", ""))
+            except (OSError, ValueError):
+                pass
+            time.sleep(10)
+
+
 def open_host_socket():
     # Raises OSError if the port is taken, e.g. a game is already hosted on this computer.
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -608,6 +673,7 @@ def open_host_socket():
 def run_host(sock, face, max_players, debug, auto_restart):
     # debug shows the load stats on screen; auto_restart is only offered with --debug.
     set_window_title("Collision Test - Host")
+    threading.Thread(target=announce_to_relay, daemon=True).start()
 
     walls = make_walls()
     wall_boxes = [to_box(wall) for wall in walls]
@@ -775,6 +841,7 @@ def run_client(join_ip, face, debug):
     sock.setblocking(False)
 
     host_ip = join_ip
+    relay = RelayListener() if join_ip is None else None
     next_discovery = 0.0
     host_button = Rectangle((SCREEN_WIDTH - 300) / 2, SCREEN_HEIGHT / 2 + 40, 300.0, 50.0)
     host_error = ""
@@ -837,7 +904,7 @@ def run_client(join_ip, face, debug):
         # Keep asking who's hosting until we're in a game (and again if the host goes away).
         if not connected and join_ip is None and get_time() >= next_discovery:
             next_discovery = get_time() + DISCOVERY_INTERVAL
-            for address in broadcast_addresses():
+            for address in broadcast_addresses() | set(relay.hosts):
                 try:
                     sock.sendto(DISCOVERY_REQUEST, (address, PORT))
                 except OSError:

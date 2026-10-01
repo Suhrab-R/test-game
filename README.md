@@ -15,9 +15,16 @@ The host has a **DAMAGE: ON / OFF** button in the top-right corner (or press T).
 off while people are joining so nobody dies in the meantime. Turning it back on starts a
 fresh round with everyone at full lives. The host can also press ENTER to restart a round.
 
-Everyone has to be on the same network (the same Wi-Fi). Some school and public Wi-Fi
-networks block devices from seeing each other; if nobody can find the host, try a phone
-hotspot instead.
+Everyone has to be on the same network (the same Wi-Fi). The game finds the host two ways:
+
+- **Broadcast:** works on home Wi-Fi and phone hotspots, no internet needed.
+- **Online relay:** for networks that block broadcasts (like campus Wi-Fi), the host also
+  posts its local IP to [ntfy.sh](https://ntfy.sh), a free message relay, and the other
+  players' games read it from there. Only the host's local network address (e.g.
+  `10.160.60.104`) is posted. This needs internet access.
+
+If a network blocks devices from talking to each other at all, nothing will work there;
+use a phone hotspot instead.
 
 ## Getting the app to send out
 
