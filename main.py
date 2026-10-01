@@ -120,6 +120,19 @@ BLINK_RATE = 10
 # otherwise they sit next to this file.
 BASE_DIR = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
 FACE_PATH = os.path.join(BASE_DIR, "pic", "image.png")
+
+
+def read_version():
+    # CollisionTest.spec writes version.txt into the packaged app, e.g. "Build 3 (7a30be5)".
+    try:
+        with open(os.path.join(BASE_DIR, "version.txt")) as f:
+            return f.read().strip()
+    except OSError:
+        return "running from source"
+
+
+# Shown in the window title and on the start screen so players can check they all have the same build.
+VERSION = read_version()
 # Square around the face in the original 1080x2400 photo.
 FACE_CROP = Rectangle(72.0, 744.0, 1008.0, 1008.0)
 FACE_TEXTURE_SIZE = 128
@@ -672,7 +685,7 @@ def open_host_socket():
 
 def run_host(sock, face, max_players, debug, auto_restart):
     # debug shows the load stats on screen; auto_restart is only offered with --debug.
-    set_window_title("Collision Test - Host")
+    set_window_title(f"Collision Test - Host - {VERSION}")
     threading.Thread(target=announce_to_relay, daemon=True).start()
 
     walls = make_walls()
@@ -938,6 +951,7 @@ def run_client(join_ip, face, debug):
             draw_centered_text("You'll join by yourself as soon as the host has started.", SCREEN_HEIGHT // 2 - 35, 20, DARKGRAY)
             draw_centered_text("Hosting? Click the button:", SCREEN_HEIGHT // 2 + 10, 20, DARKGRAY)
             draw_button(host_button, "HOST A GAME  (H)", DARKBLUE)
+            draw_centered_text(f"Version: {VERSION}", SCREEN_HEIGHT // 2 + 165, 20, DARKGRAY)
             if host_error:
                 draw_centered_text(host_error, SCREEN_HEIGHT // 2 + 110, 20, MAROON)
 
@@ -1137,7 +1151,7 @@ def main():
         return
 
     host_sock = open_host_socket() if args.host else None
-    init_window(SCREEN_WIDTH, SCREEN_HEIGHT, "Collision Test")
+    init_window(SCREEN_WIDTH, SCREEN_HEIGHT, f"Collision Test - {VERSION}")
     set_target_fps(60)
     face = load_face_texture()
     if host_sock is None:

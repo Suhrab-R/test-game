@@ -1,5 +1,9 @@
 # Builds the game for Windows and Mac every time main is pushed (or when started by hand from
-# the Actions tab). The finished files are under "Artifacts" at the bottom of each run's page.
+# the Actions tab), then publishes the files as a GitHub Release named "Build N". The newest
+# release can always be downloaded from these links, without a GitHub account:
+#   https://github.com/Suhrab-R/test-game/releases/latest/download/CollisionTest-Windows.exe
+#   https://github.com/Suhrab-R/test-game/releases/latest/download/CollisionTest-Mac-AppleSilicon.zip
+#   https://github.com/Suhrab-R/test-game/releases/latest/download/CollisionTest-Mac-Intel.zip
 name: Build game
 
 on:
@@ -45,3 +49,28 @@ jobs:
         with:
           name: ${{ matrix.artifact }}
           path: dist/${{ matrix.artifact }}.zip
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v5
+        with:
+          path: artifacts
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # Same file names every time, so the releases/latest/download links keep working.
+          mv artifacts/CollisionTest-Windows/CollisionTest.exe CollisionTest-Windows.exe
+          mv artifacts/CollisionTest-Mac-AppleSilicon/CollisionTest-Mac-AppleSilicon.zip .
+          mv artifacts/CollisionTest-Mac-Intel/CollisionTest-Mac-Intel.zip .
+          gh release create "build-${{ github.run_number }}" \
+            --repo "${{ github.repository }}" \
+            --target "${{ github.sha }}" \
+            --title "Build ${{ github.run_number }}" \
+            --notes "Built from commit ${{ github.sha }}. The game shows \"Build ${{ github.run_number }}\" on its start screen and in its window title." \
+            --latest \
+            CollisionTest-Windows.exe CollisionTest-Mac-AppleSilicon.zip CollisionTest-Mac-Intel.zip
